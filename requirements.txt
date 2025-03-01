@@ -1,8 +1,23 @@
-fastapi==0.115.6
-uvicorn==0.34.0
-pydantic==2.10.5
-google-genai
-google-auth>=2.22.0
-google-cloud-storage>=2.8.0
-pinecone>=2.2.4
-python-multipart
+# FastAPI and web server
+fastapi==0.103.1
+uvicorn==0.23.2
+pydantic==2.3.0
+
+# Data processing and scraping
+requests==2.31.0
+beautifulsoup4==4.12.2
+pandas==2.1.0
+numpy==1.25.2
+lxml==4.9.3
+tqdm==4.66.1
+
+# Google Cloud
+google-cloud-storage==2.10.0
+google-ai-generativelanguage==0.4.0
+google-generativeai==0.3.1
+
+# Pinecone
+pinecone-client==3.0.0
+
+# Utilities
+python-dotenv==1.0.0
