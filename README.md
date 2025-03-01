@@ -8,6 +8,7 @@ A minimal FastAPI application template for deployment to Google Cloud Run.
 - Containerized with Docker
 - Ready for deployment to Cloud Run
 - Minimal dependencies
+- 10-K Processing API with Google Generative AI
 
 ## Getting Started
 
@@ -17,12 +18,14 @@ A minimal FastAPI application template for deployment to Google Cloud Run.
 2. Install dependencies:
    ```
    pip install -r requirements.txt
+   gcloud auth application-default login  # For Google Cloud authentication
    ```
 3. Run the application:
    ```
    uvicorn app.main:app --reload
    ```
 4. Visit `http://localhost:8000` in your browser
+5. API documentation is available at `http://localhost:8000/docs`
 
 ### Docker Build and Run
 

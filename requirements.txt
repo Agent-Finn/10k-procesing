@@ -1,3 +1,8 @@
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.5
+google-genai
+google-auth>=2.22.0
+google-cloud-storage>=2.8.0
+pinecone>=2.2.4
+python-multipart
