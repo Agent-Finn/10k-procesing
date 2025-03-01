@@ -7,9 +7,10 @@ import sys
 from typing import Optional
 import os
 from google.cloud import storage
-
 from google import genai
 from pinecone import Pinecone, ServerlessSpec
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 router = APIRouter()
 
@@ -36,8 +37,8 @@ INDEX_HOST = "https://10k-gsf4yiq.svc.gcp-us-central1-4a9f.pinecone.io"
 def normalize_vector_id(raw_id: str) -> str:
     return unicodedata.normalize('NFKD', raw_id).encode('ascii', 'ignore').decode('ascii')
 
-def clean_text_with_gemini(text: str) -> str:
-    """Clean 10-K text using Gemini API."""
+async def clean_text_with_gemini_async(text: str) -> str:
+    """Asynchronously clean 10-K text using Gemini API."""
     prompt = (
         "Clean the following financial report text for analysis. Exclude legalese, addresses, filing info, signatures, "
         "checkmarks, tables of contents, and any tables or sections with numerical financial data. Remove page numbers, "
@@ -47,52 +48,60 @@ def clean_text_with_gemini(text: str) -> str:
         "Either return the cleaned, meaningful text, or nothing at all. Here is the text:" + text
     )
     
+    loop = asyncio.get_event_loop()
     try:
-        response = client.models.generate_content(
+        print(f"\n[GEMINI REQUEST - CLEANING] Processing text of length: {len(text)}")
+        print(f"First 100 chars: {text[:100]}...")
+        
+        response = await loop.run_in_executor(None, lambda: client.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt
-        )
-        return response.text.strip()
+        ))
+        cleaned_text = response.text.strip()
+        
+        print(f"[GEMINI RESPONSE - CLEANING] Cleaned text length: {len(cleaned_text)}")
+        print(f"First 100 chars of cleaned text: {cleaned_text[:100]}...")
+        
+        return cleaned_text
     except Exception as e:
         print(f"Error cleaning text with Gemini API: {e}", file=sys.stderr)
         return text
-    
-def create_tags_with_gemini(text: str, section_name: str, symbol: str) -> list:
-    """Create tags for a 10-K section using Gemini API, then append ticker and section name."""
+
+async def create_tags_with_gemini_async(text: str, section_name: str, symbol: str) -> list:
+    """Asynchronously create tags for a 10-K section using Gemini API."""
     prompt = (
         "You are a financial analyst. You are given a section of a 10-K report. Your job is to create a list of exactly "
         "two tags for the section. Return the tags in a list in this format: ['tag1', 'tag2']. Do not return any other "
         "text. Here is the 10k section:" + text
     )
     
+    loop = asyncio.get_event_loop()
     try:
-        response = client.models.generate_content(
+        print(f"\n[GEMINI REQUEST - TAGGING] Creating tags for section: {section_name}")
+        
+        response = await loop.run_in_executor(None, lambda: client.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt
-        )
-        # Extract the tags from the response
+        ))
         tags_text = response.text.strip()
+        print(f"[GEMINI RESPONSE - TAGGING] Raw tags response: {tags_text}")
         
-        # Try to parse as Python list
         try:
-            # Convert the string representation of a list to an actual list
             tags_list = eval(tags_text)
-            # Add ticker symbol and section name to the list
+            print(f"Parsed tags: {tags_list}")
             return tags_list
         except:
-            # If parsing fails, create a list with default tags and add symbol and section name
             print(f"Failed to parse tags: {tags_text}")
             return ["financial_report", "10k_filing"]
     except Exception as e:
         print(f"Error generating tags with Gemini API: {e}", file=sys.stderr)
-        return ["financial_report", "10k_filing", symbol, section_name]
+        return ["financial_report", "10k_filing"]
 
 def init_pinecone():
     """Initialize Pinecone connection and ensure index exists."""
     print("Initializing Pinecone...")
     pc = Pinecone(api_key=PINECONE_API_KEY)
     
-    # Check if index exists, create if not
     if INDEX_NAME not in pc.list_indexes().names():
         print(f"Creating new index: {INDEX_NAME}")
         pc.create_index(
@@ -104,7 +113,6 @@ def init_pinecone():
                 region="us-central1"
             )
         )
-        # Wait until index is ready
         while not pc.describe_index(INDEX_NAME).status['ready']:
             time.sleep(1)
     
@@ -114,33 +122,36 @@ def chunk_text(text, chunk_size=1000, chunk_overlap=200):
     """Split text into chunks with specified size and overlap."""
     if not text:
         return []
-        
     step = chunk_size - chunk_overlap
     chunks = []
-    
     for i in range(0, len(text), step):
         chunk = text[i:i+chunk_size].strip()
-        if chunk:  # Only add non-empty chunks
+        if chunk:
             chunks.append((i, chunk))
+    
+    print(f"\n[CHUNKING] Generated {len(chunks)} chunks from text of length {len(text)}")
+    if chunks:
+        print(f"Sample chunk: {chunks[0][1][:100]}...")
     
     return chunks
 
-def process_section_to_pinecone(pc, section_text, section_name, symbol, period):
-    """Process a section: clean, chunk, embed, and upload to Pinecone."""
-    # Clean the text
-    cleaned_text = clean_text_with_gemini(section_text)
+async def process_section_to_pinecone(pc, section_text, section_name, symbol, period):
+    """Process a section: clean, chunk, embed in batches, and upload to Pinecone."""
+    print(f"\n{'='*80}")
+    print(f"PROCESSING SECTION: {section_name} (Length: {len(section_text)})")
+    print(f"{'='*80}")
+    
+    # Clean the text asynchronously
+    cleaned_text = await clean_text_with_gemini_async(section_text)
     if not cleaned_text:
         print(f"Skipping empty cleaned section: {section_name}")
         return 0
     
-    # Postprocess text to normalize whitespace and remove newlines
-    # Replace multiple newlines with a single space to preserve paragraph breaks
     cleaned_text = ' '.join([para.strip() for para in cleaned_text.split('\n') if para.strip()])
-    # Replace any remaining consecutive whitespace with a single space
     cleaned_text = ' '.join(cleaned_text.split())
     
-    # Generate tags
-    tags = create_tags_with_gemini(cleaned_text, section_name, symbol)
+    # Generate tags asynchronously
+    tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol)
     
     # Chunk the cleaned text
     chunks = chunk_text(cleaned_text)
@@ -150,55 +161,76 @@ def process_section_to_pinecone(pc, section_text, section_name, symbol, period):
     
     print(f"Generated {len(chunks)} chunks for section {section_name}")
     
-    # Get Pinecone index
     index = pc.Index(INDEX_NAME, host=INDEX_HOST)
-    
-    # Process each chunk
     records = []
-    for chunk_idx, (start, chunk) in enumerate(chunks, 1):
-        try:
-            # Generate embedding
-            embeddings = pc.inference.embed(
-                model=EMBEDDING_MODEL,
-                inputs=[chunk],
-                parameters={"input_type": "passage", "truncate": "END"}
-            )
-            embedding = embeddings[0]['values']
-            
-            # Create a unique ID for the vector
-            raw_id = f"{symbol}-{period}-{section_name}-{start}"
-            vector_id = normalize_vector_id(raw_id)
-            
-            # Create record
-            record = {
-                "id": vector_id,
-                "values": embedding,
-                "metadata": {
-                    "symbol": symbol,
-                    "period_of_report": period,
-                    "section": section_name,
-                    "chunk_start": start,
-                    "preview": chunk[:200],
-                    "metatags": tags
-                }
-            }
-            records.append(record)
-            
-        except Exception as e:
-            print(f"Error processing chunk {chunk_idx}: {e}", file=sys.stderr)
     
-    # Upload records to Pinecone in batches
+    # Batch embedding
+    chunk_texts = [chunk for _, chunk in chunks]
+    try:
+        print(f"\n[EMBEDDING] Generating embeddings for {len(chunk_texts)} chunks")
+        
+        # Generate embeddings for all chunks in one call
+        embeddings = pc.inference.embed(
+            model=EMBEDDING_MODEL,
+            inputs=chunk_texts,
+            parameters={"input_type": "passage", "truncate": "END"}
+        )
+        
+        print(f"[EMBEDDING] Successfully generated {len(embeddings)} embeddings")
+        
+        # Process embeddings and create records
+        for (start, chunk), embedding in zip(chunks, embeddings):
+            try:
+                raw_id = f"{symbol}-{period}-{section_name}-{start}"
+                vector_id = normalize_vector_id(raw_id)
+                
+                record = {
+                    "id": vector_id,
+                    "values": embedding['values'],
+                    "metadata": {
+                        "symbol": symbol,
+                        "period_of_report": period,
+                        "section": section_name,
+                        "chunk_start": start,
+                        "metatags": tags,
+                        "text": chunk  # Store the chunk text here
+                    }
+                }
+                records.append(record)
+            except Exception as e:
+                print(f"Error processing chunk at start {start}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error during batch embedding for section {section_name}: {e}", file=sys.stderr)
+        return 0
+    
+    # Upsert in batches using ThreadPoolExecutor
     if records:
         batch_size = 100
         total_batches = (len(records) + batch_size - 1) // batch_size
         
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i+batch_size]
+        print(f"\n[PINECONE] Uploading {len(records)} vectors in {total_batches} batches")
+        
+        async def upsert_batch(batch):
+            loop = asyncio.get_event_loop()
             try:
-                index.upsert(vectors=batch, namespace=NAMESPACE)
-                print(f"Uploaded batch {i//batch_size + 1}/{total_batches}")
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: index.upsert(vectors=batch, namespace=NAMESPACE)),
+                    timeout=30.0  # 30-second timeout
+                )
+            except asyncio.TimeoutError:
+                print(f"Upsert batch timed out after 30 seconds", file=sys.stderr)
+                raise
             except Exception as e:
                 print(f"Error upserting batch: {e}", file=sys.stderr)
+                raise
+        
+        tasks = []
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i+batch_size]
+            tasks.append(upsert_batch(batch))
+        
+        await asyncio.gather(*tasks)
+        print(f"[PINECONE] Successfully uploaded {len(records)} vectors for section {section_name}")
     
     return len(records)
 
@@ -207,62 +239,46 @@ def read_from_gcs(bucket_name, file_path):
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(file_path)
-    
     return blob.download_as_string()
 
 @router.post("/process-10k")
 async def process_10k_gcs():
-    """
-    Process a 10-K report JSON file from Google Cloud Storage and store it in Pinecone.
-    Uses a hardcoded path: gs://finn-cleaned-data/10k_files/aapl_10k.json
-    """
+    """Process a 10-K report JSON file from Google Cloud Storage and store it in Pinecone."""
     try:
-        # Initialize Pinecone
         pc = init_pinecone()
-        
-        # Read the JSON file from GCS
         gcs_path = f"gs://{GCS_BUCKET}/{GCS_FILE_PATH}"
         print(f"Reading 10-K report from {gcs_path}")
         
-        # Load the content from GCS
         content = read_from_gcs(GCS_BUCKET, GCS_FILE_PATH)
         data = json.loads(content)
         
-        # Extract metadata and content sections
         meta = data.get("metadata", {})
         symbol = meta.get("symbol", "unknown")
         period = meta.get("period_of_report", "unknown")
         content_sections = data.get("content", {})
         
-        # Minimum character threshold for processing
         MIN_CHARS = 200
         total_vectors = 0
         processed_sections = []
         
-        # Process each section
+        # Process sections in parallel
+        async def process_section(section_name, section_text):
+            if section_name.upper() == "GENERAL" or not section_text or len(section_text) < MIN_CHARS:
+                return None
+            vectors_added = await process_section_to_pinecone(pc, section_text, section_name, symbol, period)
+            return {"section_name": section_name, "vectors_added": vectors_added} if vectors_added > 0 else None
+        
+        tasks = []
         for section_name, paragraphs in content_sections.items():
-            # Skip the GENERAL section
-            if section_name.upper() == "GENERAL":
-                continue
-                
-            # Join all paragraphs in the section
             section_text = "\n".join([str(p) for p in paragraphs]).strip()
-            if not section_text:
-                continue
-                
-            # Skip sections with few characters
-            if len(section_text) < MIN_CHARS:
-                continue
-            
-            # Process section and upload to Pinecone
-            vectors_added = process_section_to_pinecone(pc, section_text, section_name, symbol, period)
-            total_vectors += vectors_added
-            
-            if vectors_added > 0:
-                processed_sections.append({
-                    "section_name": section_name,
-                    "vectors_added": vectors_added
-                })
+            tasks.append(process_section(section_name, section_text))
+        
+        results = await asyncio.gather(*tasks)
+        
+        for result in results:
+            if result:
+                total_vectors += result["vectors_added"]
+                processed_sections.append(result)
         
         return {
             "success": True,
@@ -277,4 +293,4 @@ async def process_10k_gcs():
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e)}
-        ) 
+        )
