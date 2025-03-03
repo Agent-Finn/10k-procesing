@@ -26,53 +26,75 @@ failed_tagging_requests = 0
 failed_embedding_requests = 0
 
 # Rate limiter for Gemini API to respect Google's quotas (200 requests per minute)
+from datetime import datetime, timedelta
+import asyncio
+
+from datetime import datetime, timedelta
+import asyncio
+
 class GeminiRateLimiter:
-    def __init__(self, max_requests_per_minute=180):  # Use 180 instead of 200 for safety margin
-        self.max_requests = max_requests_per_minute
-        self.request_times = []
-        self.lock = asyncio.Lock()
+    def __init__(self, max_requests=180, period=60, min_interval=0.1):
+        """
+        Initialize the rate limiter.
+        
+        Args:
+            max_requests (int): Maximum number of requests allowed in the period (default: 180).
+            period (int): Time period in seconds (default: 60 for 1 minute).
+            min_interval (float): Minimum time in seconds between consecutive requests (default: 0.1).
+        """
+        self.max_requests = max_requests
+        self.period = period  # in seconds
+        self.min_interval = min_interval  # minimum seconds between requests
+        self.request_times = []  # List to store timestamps of requests
+        self.last_request_time = 0  # Timestamp of the last request
+        self.lock = asyncio.Lock()  # Ensure thread-safe updates
     
     async def acquire(self):
-        """Wait until a request can be made without exceeding rate limits."""
+        """
+        Acquire permission to make an API request, waiting if necessary to respect rate limits.
+        """
         async with self.lock:
-            # Remove request timestamps older than 1 minute
             now = datetime.now()
-            cutoff = now - timedelta(minutes=1)
+            # Remove requests older than the period
+            cutoff = now - timedelta(seconds=self.period)
             self.request_times = [t for t in self.request_times if t > cutoff]
             
-            # Calculate current quota usage
-            current_requests = len(self.request_times)
-            quota_percentage = (current_requests / self.max_requests) * 100
-            
-            # If we're at the limit, wait until oldest request expires
-            if current_requests >= self.max_requests:
+            # Calculate wait time for the rate limit
+            if len(self.request_times) >= self.max_requests:
                 oldest = self.request_times[0]
-                wait_time = (oldest + timedelta(minutes=1) - now).total_seconds()
-                if wait_time > 0:
-                    print(f"[RATE LIMITER] Rate limit reached. Waiting {wait_time:.2f} seconds...")
-                    await asyncio.sleep(wait_time)
-                    # Recursive call after waiting - we need to recheck
-                    await self.acquire()
-                    return
-            # If quota usage exceeds 20%, pause for a few seconds to manage rate
-            elif quota_percentage > 20:
-                pause_time = 3.0  # Pause for 3 seconds when above 20%
-                print(f"[RATE LIMITER] Quota usage at {quota_percentage:.1f}% - pausing for {pause_time} seconds...")
-                await asyncio.sleep(pause_time)
+                rate_limit_wait = (oldest + timedelta(seconds=self.period) - now).total_seconds()
+            else:
+                rate_limit_wait = 0
             
-            # Record this request
-            self.request_times.append(now)
-            return
+            # Calculate wait time for the minimum interval
+            time_since_last = now.timestamp() - self.last_request_time
+            if time_since_last < self.min_interval:
+                min_interval_wait = self.min_interval - time_since_last
+            else:
+                min_interval_wait = 0
+            
+            # Wait for the longer of the two constraints
+            wait_time = max(rate_limit_wait, min_interval_wait)
+            if wait_time > 0:
+                print(f"[RATE LIMITER] Waiting {wait_time:.2f} seconds (Rate limit: {rate_limit_wait:.2f}s, Min interval: {min_interval_wait:.2f}s)")
+                await asyncio.sleep(wait_time)
+            
+            # Update state for this request
+            self.last_request_time = datetime.now().timestamp()
+            self.request_times.append(datetime.now())
     
     def get_quota_usage(self):
-        """Return current quota usage as a percentage."""
+        """
+        Return current quota usage as a percentage.
+        """
         now = datetime.now()
-        cutoff = now - timedelta(minutes=1)
+        cutoff = now - timedelta(seconds=self.period)
         current_requests = len([t for t in self.request_times if t > cutoff])
         return (current_requests / self.max_requests) * 100
 
 # Initialize the rate limiter
-gemini_limiter = GeminiRateLimiter()
+# Initialize the rate limiter with a buffer (180 instead of 200) and a small min_interval
+gemini_limiter = GeminiRateLimiter(max_requests=180, period=60, min_interval=0.1)
 
 # Google Vertex AI settings
 PROJECT_ID = "nimble-chess-449208-f3"
