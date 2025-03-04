@@ -5,6 +5,7 @@ This document provides instructions on how to run and use the 10-K processing AP
 ## Running the Application Locally
 
 1. Install the required dependencies:
+
    ```
    pip install -r requirements.txt
    ```
@@ -12,6 +13,7 @@ This document provides instructions on how to run and use the 10-K processing AP
    Note: The application uses the `pinecone` package (not `pinecone-client` which is deprecated) for vector database operations.
 
 2. Make sure you have authenticated with Google Cloud:
+
    ```
    gcloud auth application-default login
    ```
@@ -19,6 +21,7 @@ This document provides instructions on how to run and use the 10-K processing AP
    This will authenticate your local environment to use Google Cloud services through the Application Default Credentials (ADC) mechanism. The API is configured to use this authentication for the Gemini API calls and Google Cloud Storage access.
 
 3. Run the FastAPI application:
+
    ```
    uvicorn app.main:app --reload
    ```
@@ -34,17 +37,20 @@ The API provides an endpoint to process 10-K reports and store them in Pinecone.
 This endpoint reads the 10-K report from the hardcoded GCS path (`gs://finn-cleaned-data/10k_files/aapl_10k.json`), processes it, and stores the embeddings in Pinecone.
 
 **Request:**
+
 - Method: POST
 - URL: `http://localhost:8000/api/v1/process-10k`
 - No body parameters required
 
 **Sample Request using curl:**
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/process-10k" \
   -H "accept: application/json"
 ```
 
 **Sample Request using Python:**
+
 ```python
 import requests
 
@@ -54,6 +60,7 @@ print(response.json())
 ```
 
 **Response:**
+
 ```json
 {
   "success": true,
@@ -77,15 +84,38 @@ print(response.json())
 ## Interactive Documentation
 
 FastAPI provides interactive API documentation. You can access it at:
+
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
 ## Notes
 
-- The API currently reads from a hardcoded Google Cloud Storage path. This is configured in the `app/routes/process_10k.py` file.
+- The API currently reads from a hardcoded Google Cloud Storage path. This is configured in the `app/main.py` file.
 - The API uses Google Cloud authentication through Application Default Credentials (ADC).
-- The Pinecone settings are also hardcoded in the `app/routes/process_10k.py` file.
+- The Pinecone settings are also hardcoded in the `app/main.py` file.
 
 - The API currently uses hardcoded values for Google Cloud and Pinecone settings. For production use, these should be moved to environment variables.
 - The current implementation processes 10-K reports in the format shown in the `test_10k.json` file.
-- The API is configured to run locally, but can be deployed to Google Cloud Run using the provided Dockerfile. 
+- The API is configured to run locally, but can be deployed to Google Cloud Run using the provided Dockerfile.
+
+## Command-Line Batch Processing
+
+In addition to the API, the application provides a command-line interface for batch processing 10-K filings:
+
+```bash
+# Process all S&P 500 company filings
+python run_processor.py
+
+# Process specific companies
+python run_processor.py --symbols AAPL MSFT GOOGL
+
+# Specify custom output directory
+python run_processor.py --output-dir ./custom_output_dir
+```
+
+The command-line tool provides the following options:
+
+- `--symbols`: Optional list of company symbols to process (e.g., AAPL MSFT GOOGL)
+- `--output-dir`: Custom directory to save output files (default: ./sp500_10k)
+
+Results will be saved in JSON format in the specified output directory.

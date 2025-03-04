@@ -30,11 +30,13 @@ A minimal FastAPI application template for deployment to Google Cloud Run.
 ### Docker Build and Run
 
 Build the Docker image:
+
 ```
 docker build -t cloud-run-boilerplate .
 ```
 
 Run the container:
+
 ```
 docker run -p 8000:8000 cloud-run-boilerplate
 ```
@@ -106,6 +108,7 @@ curl -X POST http://localhost:8000/process-by-ticker \
 ```
 
 This endpoint handles the entire process:
+
 - Fetches the 10-K report from SEC EDGAR
 - Cleans and processes the content
 - Generates embeddings
@@ -141,13 +144,20 @@ To process specific companies:
 python sp500_10k_processor.py --symbols AAPL MSFT GOOGL
 ```
 
-## Folder Structure
+## Project Structure
 
-- `app/`: FastAPI application
-  - `routes/process_10k.py`: API endpoints for processing 10-K reports
-  - `main.py`: FastAPI entry point
-- `sp500_10k_processor.py`: Script to download and process 10-K reports
-- `sp500_10k/`: Directory where downloaded 10-K reports are stored
+- `app/`: Main application package
+  - `main.py`: FastAPI application with API endpoints
+  - `processor.py`: Core 10-K processing logic
+  - `cli.py`: Command-line interface for batch processing
+  - `sec_data.py`: SEC EDGAR data retrieval
+  - `vector_db.py`: Vector database operations
+  - `ai_processor.py`: AI processing of 10-K data
+  - `utils.py`: Utility functions for text processing
+- `run_processor.py`: Entry point script for batch processing 10-K filings
+- `cleanup.py`: Utility to clean up pycache files
+- `requirements.txt`: Python dependencies
+- `Dockerfile`: Container definition
 
 ## Notes
 
