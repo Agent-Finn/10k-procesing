@@ -196,25 +196,24 @@ async def clean_text_with_gemini_async(text: str, max_retries=5, initial_delay=4
     print(f"[FAILED REQUESTS] Cleaning failures: {failed_cleaning_requests}")
     return text
 
-async def create_tags_with_gemini_async(text: str, section_name: str, symbol: str, max_retries=5, initial_delay=4) -> list:
-    """Asynchronously create tags for a 10-K section using Gemini API with retry logic for rate limiting."""
+async def create_tags_with_gemini_async(text: str, section_name: str, symbol: str, num_tags: int = 2, max_retries=5, initial_delay=4) -> list:
+    """Asynchronously create tags for a 10-K section or chunk using Gemini API with retry logic for rate limiting."""
     global failed_tagging_requests
     
     prompt = (
-        "You are a financial analyst. You are given a section of a 10-K report. Your job is to create a list of exactly "
-        "two tags for the section. Return the tags in a list in this format: ['tag1', 'tag2']. Do not return any other "
-        "text. Here is the 10k section:" + text
+        "You are a financial analyst. You are given a part of a 10-K report. Your job is to create a list of exactly "
+        f"{num_tags} tags that capture the key topics or points in this text. Return the tags in a list in this format: "
+        f"['tag1', 'tag2', ...], where each tag is no longer than 3-4 words. Do not return any other text. Here is the text:" + text
     )
     
     loop = asyncio.get_event_loop()
     
     for attempt in range(max_retries):
         try:
-            # Wait for rate limiter approval before proceeding
             await gemini_limiter.acquire()
             
             quota_usage = gemini_limiter.get_quota_usage()
-            print(f"\n[GEMINI REQUEST - TAGGING] Creating tags for section: {section_name} (Quota usage: {quota_usage:.1f}%)")
+            print(f"\n[GEMINI REQUEST - TAGGING] Creating {num_tags} tags for section: {section_name} (Quota usage: {quota_usage:.1f}%)")
             
             response = await loop.run_in_executor(None, lambda: client.models.generate_content(
                 model="gemini-2.0-flash",
@@ -231,37 +230,105 @@ async def create_tags_with_gemini_async(text: str, section_name: str, symbol: st
                 print(f"Failed to parse tags: {tags_text}")
                 failed_tagging_requests += 1
                 print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
-                return ["financial_report", "10k_filing"]
+                return [f"default_tag{i+1}" for i in range(num_tags)]
         
         except Exception as e:
-            # Check if this is a rate limit error
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                # Calculate exponential backoff delay with jitter (randomness)
                 base_delay = initial_delay * (2 ** attempt)
-                jitter = base_delay * 0.2 * (0.5 - random.random())  # ±10% randomness
+                jitter = base_delay * 0.2 * (0.5 - random.random())
                 delay = base_delay + jitter
                 
                 print(f"[RATE LIMIT] Gemini API rate limited. Retrying in {delay:.2f} seconds... (Attempt {attempt+1}/{max_retries})")
                 print(f"[RATE LIMIT] Error details: {str(e)}")
                 await asyncio.sleep(delay)
                 
-                # If this was the last attempt, use default tags
                 if attempt == max_retries - 1:
                     print(f"Error generating tags with Gemini API after {max_retries} attempts: {e}", file=sys.stderr)
                     failed_tagging_requests += 1
                     print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
-                    return ["financial_report", "10k_filing"]
+                    return [f"default_tag{i+1}" for i in range(num_tags)]
             else:
-                # For non-rate-limit errors, don't retry
                 print(f"Error generating tags with Gemini API: {e}", file=sys.stderr)
                 failed_tagging_requests += 1
                 print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
-                return ["financial_report", "10k_filing"]
+                return [f"default_tag{i+1}" for i in range(num_tags)]
     
-    # If we get here, all retries failed
     failed_tagging_requests += 1
     print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
-    return ["financial_report", "10k_filing"]
+    return [f"default_tag{i+1}" for i in range(num_tags)]
+
+def split_section_into_chunks(text, max_length=2048, min_length=100):
+    """
+    Split a section into chunks with full sentences, each <= max_length characters.
+    
+    Args:
+        text (str): The cleaned section text to split.
+        max_length (int): Maximum character length per chunk (default: 2048).
+        min_length (int): Minimum character length to include a chunk (default: 100).
+    
+    Returns:
+        List[Tuple[int, str]]: List of (chunk_index, chunk_text) pairs.
+    """
+    if len(text) <= max_length:
+        if len(text) >= min_length:
+            return [(0, text)]
+        return []
+
+    # Split into sentences using period followed by whitespace
+    sentences = re.split(r'(?<=\.)\s+', text.strip())
+    # Ensure trailing sentences without periods are handled
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        return []
+
+    num_sentences = len(sentences)
+    if num_sentences <= 1:
+        # If only one sentence and it's > 2048, split it into parts
+        if len(text) >= min_length:
+            return [(0, text)]  # Let the embedding model truncate if needed
+        return []
+
+    # Initial split into two parts
+    def split_into_two(start_idx, end_idx):
+        mid = (start_idx + end_idx) // 2
+        # Adjust mid to the nearest sentence boundary
+        left_chunk = ' '.join(sentences[start_idx:mid + 1])
+        right_chunk = ' '.join(sentences[mid + 1:end_idx + 1])
+        return left_chunk, right_chunk
+
+    # Recursive function to split chunks
+    def recursive_split(chunk_text, chunk_idx):
+        if len(chunk_text) <= max_length:
+            if len(chunk_text) >= min_length:
+                return [(chunk_idx, chunk_text)]
+            return []
+        
+        local_sentences = re.split(r'(?<=\.)\s+', chunk_text.strip())
+        local_sentences = [s.strip() for s in local_sentences if s.strip()]
+        if len(local_sentences) <= 1:
+            if len(chunk_text) >= min_length:
+                return [(chunk_idx, chunk_text)]
+            return []
+        
+        mid = len(local_sentences) // 2
+        left_chunk = ' '.join(local_sentences[:mid + 1])
+        right_chunk = ' '.join(local_sentences[mid + 1:])
+        
+        result = []
+        result.extend(recursive_split(left_chunk, chunk_idx))
+        if right_chunk:
+            result.extend(recursive_split(right_chunk, chunk_idx + 1))
+        return result
+
+    # Start with an initial split into two
+    left_chunk, right_chunk = split_into_two(0, num_sentences - 1)
+    chunks = recursive_split(left_chunk, 0)
+    if right_chunk:
+        chunks.extend(recursive_split(right_chunk, len(chunks)))
+
+    # Assign continuous chunk indices
+    return [(i, chunk) for i, (_, chunk) in enumerate(chunks) if len(chunk) >= min_length]
 
 def init_pinecone():
     """Initialize Pinecone connection and ensure index exists."""
@@ -284,27 +351,8 @@ def init_pinecone():
     
     return pc
 
-def chunk_text(text, chunk_size=1000, chunk_overlap=200, min_chunk_length=100):
-    """Split text into chunks with specified size and overlap.
-    Skips chunks with fewer than min_chunk_length characters."""
-    if not text:
-        return []
-    step = chunk_size - chunk_overlap
-    chunks = []
-    for i in range(0, len(text), step):
-        chunk = text[i:i+chunk_size].strip()
-        if chunk and len(chunk) >= min_chunk_length:
-            chunks.append((i, chunk))
-    
-    print(f"\n[CHUNKING] Generated {len(chunks)} chunks from text of length {len(text)}")
-    if chunks:
-        print(f"Sample chunk: {chunks[0][1][:100]}...")
-    else:
-        print(f"No chunks generated: all chunks were under minimum length of {min_chunk_length} characters")
-    
-    return chunks
 
-async def process_section_to_pinecone(pc, section_text, section_name, symbol, period, namespace=None, fiscal_year=None):
+async def process_section_to_pinecone(pc, section_text, section_name, symbol, period, namespace=None, fiscal_year=None, number_of_chunks: Optional[int] = None):
     """Process a section: clean, chunk, embed in batches, and upload to Pinecone."""
     global failed_embedding_requests
     
@@ -321,24 +369,27 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     cleaned_text = ' '.join([para.strip() for para in cleaned_text.split('\n') if para.strip()])
     cleaned_text = ' '.join(cleaned_text.split())
     
-    # Chunk the cleaned text - skip chunks with fewer than 100 characters
-    chunks = chunk_text(cleaned_text, min_chunk_length=100)
+    # Split into chunks (number_of_chunks is optional and not used here as chunking is dynamic)
+    chunks = split_section_into_chunks(cleaned_text, max_length=2048, min_length=100)
     if not chunks:
         print(f"No chunks generated for section: {section_name}")
         return 0
     
-    # Generate tags asynchronously - only if we have chunks to process
-    tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol)
-    
     print(f"Generated {len(chunks)} chunks for section {section_name}")
     
-    # Use the provided fiscal year if available, otherwise extract year from period (first 4 characters)
+    # Generate one tag for the section
+    section_tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol, num_tags=1)
+    section_tag = section_tags[0] if section_tags else "default_section_tag"
+    
+    # Generate two tags for each chunk concurrently
+    chunk_tags_tasks = [create_tags_with_gemini_async(chunk, section_name, symbol, num_tags=2) for _, chunk in chunks]
+    all_chunk_tags = await asyncio.gather(*chunk_tags_tasks)
+    
+    # Namespace handling
     if fiscal_year is None:
         year = period[:4] if period and len(period) >= 4 else "unknown"
     else:
         year = fiscal_year
-    
-    # Format namespace as {ticker}-{year}
     updated_namespace = f"{symbol}-{year}"
     
     print(f"Using namespace: {updated_namespace} (Fiscal Year: {year})")
@@ -346,63 +397,59 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     index = pc.Index(INDEX_NAME, host=INDEX_HOST)
     records = []
     
-    # Batch embedding with maximum batch size of 96 (llama-text-embed-v2 limit)
+    # Batch embedding
     MAX_EMBEDDING_BATCH_SIZE = 96
     chunk_texts = [chunk for _, chunk in chunks]
     
     try:
         print(f"\n[EMBEDDING] Processing {len(chunk_texts)} chunks in batches of {MAX_EMBEDDING_BATCH_SIZE}")
         
-        # Process embeddings in batches of 96 or fewer
         all_embeddings = []
         for i in range(0, len(chunk_texts), MAX_EMBEDDING_BATCH_SIZE):
-            batch = chunk_texts[i:i+MAX_EMBEDDING_BATCH_SIZE]
-            print(f"[EMBEDDING] Generating embeddings for batch {i//MAX_EMBEDDING_BATCH_SIZE + 1} with {len(batch)} chunks")
+            batch = chunk_texts[i:i + MAX_EMBEDDING_BATCH_SIZE]
+            print(f"[EMBEDDING] Generating embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1} with {len(batch)} chunks")
             
             try:
-                # Generate embeddings for this batch
                 batch_embeddings = pc.inference.embed(
                     model=EMBEDDING_MODEL,
                     inputs=batch,
                     parameters={"input_type": "passage", "truncate": "END"}
                 )
-                
                 all_embeddings.extend(batch_embeddings)
-                print(f"[EMBEDDING] Successfully generated {len(batch_embeddings)} embeddings for batch {i//MAX_EMBEDDING_BATCH_SIZE + 1}")
+                print(f"[EMBEDDING] Successfully generated {len(batch_embeddings)} embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1}")
             except Exception as e:
-                print(f"[EMBEDDING ERROR] Failed to generate embeddings for batch {i//MAX_EMBEDDING_BATCH_SIZE + 1}: {str(e)}")
+                print(f"[EMBEDDING ERROR] Failed to generate embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1}: {str(e)}")
                 failed_embedding_requests += 1
                 print(f"[FAILED REQUESTS] Embedding failures: {failed_embedding_requests}")
-                # Continue with the next batch
                 continue
         
         print(f"[EMBEDDING] Total embeddings generated: {len(all_embeddings)}")
         
-        # Process embeddings and create records
-        for (start, chunk), embedding in zip(chunks, all_embeddings):
+        # Create records with combined tags
+        for (chunk_idx, chunk), embedding, chunk_tags in zip(chunks, all_embeddings, all_chunk_tags):
             try:
-                raw_id = f"{symbol}-{period}-{section_name}-{start}"
+                metatags = [section_tag] + chunk_tags  # Combine section tag with chunk tags
+                raw_id = f"{symbol}-{period}-chunk_{chunk_idx}"
                 vector_id = normalize_vector_id(raw_id)
                 
                 record = {
                     "id": vector_id,
                     "values": embedding['values'],
                     "metadata": {
-                        "chunk_start": start,
-                        "metatags": tags,
-                        "text": chunk,  # Store the chunk text here
+                        "metatags": metatags,
+                        "text": chunk,
                     }
                 }
                 records.append(record)
             except Exception as e:
-                print(f"Error processing chunk at start {start}: {e}", file=sys.stderr)
+                print(f"Error processing chunk {chunk_idx}: {e}", file=sys.stderr)
     except Exception as e:
         print(f"Error during batch embedding for section {section_name}: {e}", file=sys.stderr)
         failed_embedding_requests += 1
         print(f"[FAILED REQUESTS] Embedding failures: {failed_embedding_requests}")
         return 0
     
-    # Upsert in batches using ThreadPoolExecutor
+    # Upsert in batches
     if records:
         batch_size = 100
         total_batches = (len(records) + batch_size - 1) // batch_size
@@ -414,7 +461,7 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
             try:
                 await asyncio.wait_for(
                     loop.run_in_executor(None, lambda: index.upsert(vectors=batch, namespace=updated_namespace)),
-                    timeout=30.0  # 30-second timeout
+                    timeout=30.0
                 )
             except asyncio.TimeoutError:
                 print(f"Upsert batch timed out after 30 seconds", file=sys.stderr)
@@ -425,7 +472,7 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
         
         tasks = []
         for i in range(0, len(records), batch_size):
-            batch = records[i:i+batch_size]
+            batch = records[i:i + batch_size]
             tasks.append(upsert_batch(batch))
         
         await asyncio.gather(*tasks)
