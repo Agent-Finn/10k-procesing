@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 import asyncio
 
 class GeminiRateLimiter:
-    def __init__(self, max_requests=180, period=60, min_interval=0.1):
+    def __init__(self, max_requests=30, period=60, min_interval=0.1):
         """
         Initialize the rate limiter.
         
@@ -94,7 +94,7 @@ class GeminiRateLimiter:
 
 # Initialize the rate limiter
 # Initialize the rate limiter with a buffer (180 instead of 200) and a small min_interval
-gemini_limiter = GeminiRateLimiter(max_requests=180, period=60, min_interval=0.1)
+gemini_limiter = GeminiRateLimiter(max_requests=30, period=60, min_interval=0.1)
 
 # Google Vertex AI settings
 PROJECT_ID = "nimble-chess-449208-f3"
