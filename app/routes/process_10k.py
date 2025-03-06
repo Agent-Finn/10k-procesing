@@ -17,6 +17,18 @@ import re
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import random
+import logging
+import math
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("10k_processing")
 
 router = APIRouter()
 
@@ -25,16 +37,24 @@ failed_cleaning_requests = 0
 failed_tagging_requests = 0 
 failed_embedding_requests = 0
 
+# Global counters for tracking embeddings and storage operations
+embeddings_created = 0
+embeddings_pushed_to_pinecone = 0
+records_pushed_to_gcs = 0
+
 # Rate limiter for Gemini API to respect Google's quotas (200 requests per minute)
 def upload_to_gcs_sync(bucket_name, file_path, data):
+    global records_pushed_to_gcs
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_path)
         blob.upload_from_string(json.dumps(data), content_type='application/json')
-        print(f"Uploaded {file_path} to GCS")
+        records_pushed_to_gcs += 1
+        logger.info(f"Successfully uploaded file to GCS: {file_path}")
     except Exception as e:
-        print(f"Error uploading {file_path} to GCS: {e}", file=sys.stderr)
+        logger.error(f"Failed to upload file to GCS: {file_path}. Error: {str(e)}")
+        pass
 
 class GeminiRateLimiter:
     def __init__(self, max_requests=30, period=60, min_interval=0.1):
@@ -59,7 +79,6 @@ class GeminiRateLimiter:
             min_interval_wait = self.min_interval - time_since_last if time_since_last < self.min_interval else 0
             wait_time = max(rate_limit_wait, min_interval_wait)
             if wait_time > 0:
-                print(f"[RATE LIMITER] Waiting {wait_time:.2f} seconds (Rate limit: {rate_limit_wait:.2f}s, Min interval: {min_interval_wait:.2f}s)")
                 await asyncio.sleep(wait_time)
             self.last_request_time = datetime.now().timestamp()
             self.request_times.append(datetime.now())
@@ -105,6 +124,9 @@ def normalize_vector_id(raw_id: str) -> str:
 
 async def clean_text_with_gemini_async(text: str, max_retries=5, initial_delay=4) -> str:
     global failed_cleaning_requests
+    # Create a truncated version of the text for logging (first 100 chars)
+    truncated_text = text[:100] + "..." if len(text) > 100 else text
+    
     prompt = (
         "Clean the following financial report text for analysis. Exclude legalese, addresses, filing info, signatures, "
         "checkmarks, tables of contents, and any tables or sections with numerical financial data. Remove page numbers, "
@@ -118,40 +140,39 @@ async def clean_text_with_gemini_async(text: str, max_retries=5, initial_delay=4
         try:
             await gemini_limiter.acquire()
             quota_usage = gemini_limiter.get_quota_usage()
-            print(f"\n[GEMINI REQUEST - CLEANING] Processing text of length: {len(text)} (Quota usage: {quota_usage:.1f}%)")
-            print(f"First 100 chars: {text[:100]}...")
             response = await loop.run_in_executor(None, lambda: client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=prompt
             ))
+            # Check if response.text is None before calling strip()
+            if response.text is None:
+                logger.warning(f"Gemini returned None response for text: {truncated_text}")
+                return ""  # Return empty string to skip this section
             cleaned_text = response.text.strip()
-            print(f"[GEMINI RESPONSE - CLEANING] Cleaned text length: {len(cleaned_text)}")
-            print(f"First 100 chars of cleaned text: {cleaned_text[:100]}...")
             return cleaned_text
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                 base_delay = initial_delay * (2 ** attempt)
                 jitter = base_delay * 0.2 * (0.5 - random.random())
                 delay = base_delay + jitter
-                print(f"[RATE LIMIT] Gemini API rate limited. Retrying in {delay:.2f} seconds... (Attempt {attempt+1}/{max_retries})")
-                print(f"[RATE LIMIT] Error details: {str(e)}")
                 await asyncio.sleep(delay)
                 if attempt == max_retries - 1:
-                    print(f"Error cleaning text with Gemini API after {max_retries} attempts: {e}", file=sys.stderr)
                     failed_cleaning_requests += 1
-                    print(f"[FAILED REQUESTS] Cleaning failures: {failed_cleaning_requests}")
+                    logger.error(f"Failed to clean text after {max_retries} attempts due to rate limiting. Error: {str(e)}. Text: {truncated_text}")
                     return text
             else:
-                print(f"Error cleaning text with Gemini API: {e}", file=sys.stderr)
                 failed_cleaning_requests += 1
-                print(f"[FAILED REQUESTS] Cleaning failures: {failed_cleaning_requests}")
-                return text
+                logger.error(f"Failed to clean text due to error: {str(e)}. Text: {truncated_text}")
+                return ""  # Return empty string to skip this section on error
     failed_cleaning_requests += 1
-    print(f"[FAILED REQUESTS] Cleaning failures: {failed_cleaning_requests}")
-    return text
+    logger.error(f"Failed to clean text after exhausting all retries. Text: {truncated_text}")
+    return ""  # Return empty string to skip this section after all retries
 
 async def create_tags_with_gemini_async(text: str, section_name: str, symbol: str, num_tags: int = 2, max_retries=5, initial_delay=4) -> list:
     global failed_tagging_requests
+    # Create a truncated version of the text for logging (first 100 chars)
+    truncated_text = text[:100] + "..." if len(text) > 100 else text
+    
     prompt = (
         "You are a financial analyst. You are given a part of a 10-K report. Your job is to create a list of exactly "
         f"{num_tags} tags that capture the key topics or points in this text. Return the tags in a list in this format: "
@@ -162,93 +183,107 @@ async def create_tags_with_gemini_async(text: str, section_name: str, symbol: st
         try:
             await gemini_limiter.acquire()
             quota_usage = gemini_limiter.get_quota_usage()
-            print(f"\n[GEMINI REQUEST - TAGGING] Creating {num_tags} tags for section: {section_name} (Quota usage: {quota_usage:.1f}%)")
             response = await loop.run_in_executor(None, lambda: client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=prompt
             ))
             tags_text = response.text.strip()
-            print(f"[GEMINI RESPONSE - TAGGING] Raw tags response: {tags_text}")
             try:
                 tags_list = eval(tags_text)
-                print(f"Parsed tags: {tags_list}")
                 return tags_list
             except:
-                print(f"Failed to parse tags: {tags_text}")
                 failed_tagging_requests += 1
-                print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
+                logger.error(f"Failed to parse tags response for section '{section_name}' of {symbol}. Response: {tags_text}. Text: {truncated_text}")
                 return [f"default_tag{i+1}" for i in range(num_tags)]
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                 base_delay = initial_delay * (2 ** attempt)
                 jitter = base_delay * 0.2 * (0.5 - random.random())
                 delay = base_delay + jitter
-                print(f"[RATE LIMIT] Gemini API rate limited. Retrying in {delay:.2f} seconds... (Attempt {attempt+1}/{max_retries})")
-                print(f"[RATE LIMIT] Error details: {str(e)}")
                 await asyncio.sleep(delay)
                 if attempt == max_retries - 1:
-                    print(f"Error generating tags with Gemini API after {max_retries} attempts: {e}", file=sys.stderr)
                     failed_tagging_requests += 1
-                    print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
+                    logger.error(f"Failed to create tags for section '{section_name}' of {symbol} after {max_retries} attempts due to rate limiting. Error: {str(e)}. Text: {truncated_text}")
                     return [f"default_tag{i+1}" for i in range(num_tags)]
             else:
-                print(f"Error generating tags with Gemini API: {e}", file=sys.stderr)
                 failed_tagging_requests += 1
-                print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
+                logger.error(f"Failed to create tags for section '{section_name}' of {symbol} due to error: {str(e)}. Text: {truncated_text}")
                 return [f"default_tag{i+1}" for i in range(num_tags)]
     failed_tagging_requests += 1
-    print(f"[FAILED REQUESTS] Tagging failures: {failed_tagging_requests}")
+    logger.error(f"Failed to create tags for section '{section_name}' of {symbol} after exhausting all retries. Text: {truncated_text}")
     return [f"default_tag{i+1}" for i in range(num_tags)]
 
 def split_section_into_chunks(text, max_length=2048, min_length=100):
+    """
+    Split a section of text into chunks of maximum length, ensuring that sentences stay together.
+    Uses a non-recursive approach to avoid maximum recursion depth errors.
+    
+    Args:
+        text: The text to split
+        max_length: Maximum length of each chunk
+        min_length: Minimum length for a chunk to be considered valid
+        
+    Returns:
+        List of tuples (index, chunk_text)
+    """
+    # If text is already small enough, return it as a single chunk
     if len(text) <= max_length:
         if len(text) >= min_length:
             return [(0, text)]
         return []
+    
+    # Split text into sentences
     sentences = re.split(r'(?<=\.)\s+', text.strip())
     sentences = [s.strip() for s in sentences if s.strip()]
+    
     if not sentences:
         return []
-    num_sentences = len(sentences)
-    if num_sentences <= 1:
+    
+    # If there's only one sentence and it's too long, return it anyway
+    if len(sentences) <= 1:
         if len(text) >= min_length:
             return [(0, text)]
         return []
-    def split_into_two(start_idx, end_idx):
-        mid = (start_idx + end_idx) // 2
-        left_chunk = ' '.join(sentences[start_idx:mid + 1])
-        right_chunk = ' '.join(sentences[mid + 1:end_idx + 1])
-        return left_chunk, right_chunk
-    def recursive_split(chunk_text, chunk_idx):
-        if len(chunk_text) <= max_length:
+    
+    # Calculate how many chunks we need based on total text length
+    total_length = len(text)
+    num_chunks_needed = max(1, math.ceil(total_length / max_length))
+    
+    # Calculate target sentences per chunk
+    total_sentences = len(sentences)
+    target_sentences_per_chunk = math.ceil(total_sentences / num_chunks_needed)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    chunk_index = 0
+    
+    for sentence in sentences:
+        # If adding this sentence would exceed max_length and we already have content,
+        # finalize the current chunk and start a new one
+        if current_length + len(sentence) > max_length and current_chunk:
+            chunk_text = ' '.join(current_chunk)
             if len(chunk_text) >= min_length:
-                return [(chunk_idx, chunk_text)]
-            return []
-        local_sentences = re.split(r'(?<=\.)\s+', chunk_text.strip())
-        local_sentences = [s.strip() for s in local_sentences if s.strip()]
-        if len(local_sentences) <= 1:
-            if len(chunk_text) >= min_length:
-                return [(chunk_idx, chunk_text)]
-            return []
-        mid = len(local_sentences) // 2
-        left_chunk = ' '.join(local_sentences[:mid + 1])
-        right_chunk = ' '.join(local_sentences[mid + 1:])
-        result = []
-        result.extend(recursive_split(left_chunk, chunk_idx))
-        if right_chunk:
-            result.extend(recursive_split(right_chunk, chunk_idx + 1))
-        return result
-    left_chunk, right_chunk = split_into_two(0, num_sentences - 1)
-    chunks = recursive_split(left_chunk, 0)
-    if right_chunk:
-        chunks.extend(recursive_split(right_chunk, len(chunks)))
-    return [(i, chunk) for i, (_, chunk) in enumerate(chunks) if len(chunk) >= min_length]
+                chunks.append((chunk_index, chunk_text))
+                chunk_index += 1
+            current_chunk = []
+            current_length = 0
+        
+        # Add the sentence to the current chunk
+        current_chunk.append(sentence)
+        current_length += len(sentence) + 1  # +1 for the space
+    
+    # Don't forget the last chunk
+    if current_chunk:
+        chunk_text = ' '.join(current_chunk)
+        if len(chunk_text) >= min_length:
+            chunks.append((chunk_index, chunk_text))
+    
+    return chunks
 
 def init_pinecone():
-    print("Initializing Pinecone...")
     pc = Pinecone(api_key=PINECONE_API_KEY)
     if INDEX_NAME not in pc.list_indexes().names():
-        print(f"Creating new index: {INDEX_NAME}")
         pc.create_index(
             name=INDEX_NAME,
             dimension=EMBEDDING_DIMENSIONS,
@@ -263,21 +298,22 @@ def init_pinecone():
     return pc
 
 async def process_section_to_pinecone(pc, section_text, section_name, symbol, period, namespace=None, fiscal_year=None, number_of_chunks: Optional[int] = None):
-    global failed_embedding_requests
-    print(f"\n{'='*80}")
-    print(f"PROCESSING SECTION: {section_name} (Length: {len(section_text)})")
-    print(f"{'='*80}")
+    global failed_embedding_requests, embeddings_created, embeddings_pushed_to_pinecone
+    
+    # Log the section being processed
+    truncated_text = section_text[:100] + "..." if len(section_text) > 100 else section_text
+    logger.info(f"Processing section '{section_name}' for {symbol}, period {period}. Text length: {len(section_text)}")
+    
     cleaned_text = await clean_text_with_gemini_async(section_text)
     if not cleaned_text:
-        print(f"Skipping empty cleaned section: {section_name}")
+        logger.warning(f"Section '{section_name}' for {symbol} returned empty after cleaning. Original text: {truncated_text}")
         return 0
     cleaned_text = ' '.join([para.strip() for para in cleaned_text.split('\n') if para.strip()])
     cleaned_text = ' '.join(cleaned_text.split())
     chunks = split_section_into_chunks(cleaned_text, max_length=2048, min_length=100)
     if not chunks:
-        print(f"No chunks generated for section: {section_name}")
+        logger.warning(f"No chunks created for section '{section_name}' of {symbol} after cleaning. Cleaned text length: {len(cleaned_text)}")
         return 0
-    print(f"Generated {len(chunks)} chunks for section {section_name}")
     section_tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol, num_tags=1)
     section_tag = section_tags[0] if section_tags else "default_section_tag"
     chunk_tags_tasks = [create_tags_with_gemini_async(chunk, section_name, symbol, num_tags=2) for _, chunk in chunks]
@@ -287,17 +323,14 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     else:
         year = fiscal_year
     updated_namespace = f"{symbol}-{year}"
-    print(f"Using namespace: {updated_namespace} (Fiscal Year: {year})")
     index = pc.Index(INDEX_NAME, host=INDEX_HOST)
     records = []
     MAX_EMBEDDING_BATCH_SIZE = 96
     chunk_texts = [chunk for _, chunk in chunks]
     try:
-        print(f"\n[EMBEDDING] Processing {len(chunk_texts)} chunks in batches of {MAX_EMBEDDING_BATCH_SIZE}")
         all_embeddings = []
         for i in range(0, len(chunk_texts), MAX_EMBEDDING_BATCH_SIZE):
             batch = chunk_texts[i:i + MAX_EMBEDDING_BATCH_SIZE]
-            print(f"[EMBEDDING] Generating embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1} with {len(batch)} chunks")
             try:
                 batch_embeddings = pc.inference.embed(
                     model=EMBEDDING_MODEL,
@@ -305,17 +338,15 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
                     parameters={"input_type": "passage", "truncate": "END"}
                 )
                 all_embeddings.extend(batch_embeddings)
-                print(f"[EMBEDDING] Successfully generated {len(batch_embeddings)} embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1}")
+                embeddings_created += len(batch_embeddings)
             except Exception as e:
-                print(f"[EMBEDDING ERROR] Failed to generate embeddings for batch {i // MAX_EMBEDDING_BATCH_SIZE + 1}: {str(e)}")
                 failed_embedding_requests += 1
-                print(f"[FAILED REQUESTS] Embedding failures: {failed_embedding_requests}")
+                logger.error(f"Failed to create embeddings for batch {i//MAX_EMBEDDING_BATCH_SIZE + 1} of section '{section_name}' for {symbol}. Error: {str(e)}")
                 continue
-        print(f"[EMBEDDING] Total embeddings generated: {len(all_embeddings)}")
         for (chunk_idx, chunk), embedding, chunk_tags in zip(chunks, all_embeddings, all_chunk_tags):
             try:
                 metatags = [section_tag] + chunk_tags
-                raw_id = f"{symbol}-{period}-chunk_{chunk_idx}"
+                raw_id = f"{symbol}-{period}-{section_name}-chunk_{chunk_idx}"
                 vector_id = normalize_vector_id(raw_id)
                 json_data = {
                     "symbol": symbol,
@@ -339,35 +370,35 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
                 }
                 records.append(record)
             except Exception as e:
-                print(f"Error processing chunk {chunk_idx}: {e}", file=sys.stderr)
+                pass
     except Exception as e:
-        print(f"Error during batch embedding for section {section_name}: {e}", file=sys.stderr)
         failed_embedding_requests += 1
-        print(f"[FAILED REQUESTS] Embedding failures: {failed_embedding_requests}")
         return 0
     if records:
         batch_size = 100
         total_batches = (len(records) + batch_size - 1) // batch_size
-        print(f"\n[PINECONE] Uploading {len(records)} vectors in {total_batches} batches")
         async def upsert_batch(batch):
+            global embeddings_pushed_to_pinecone
             loop = asyncio.get_event_loop()
             try:
+                logger.info(f"Upserting batch of {len(batch)} vectors to Pinecone namespace '{updated_namespace}'")
                 await asyncio.wait_for(
                     loop.run_in_executor(None, lambda: index.upsert(vectors=batch, namespace=updated_namespace)),
                     timeout=30.0
                 )
+                embeddings_pushed_to_pinecone += len(batch)
+                logger.info(f"Successfully upserted {len(batch)} vectors to Pinecone namespace '{updated_namespace}'")
             except asyncio.TimeoutError:
-                print(f"Upsert batch timed out after 30 seconds", file=sys.stderr)
+                logger.error(f"Timeout error while upserting batch of {len(batch)} vectors to Pinecone namespace '{updated_namespace}'")
                 raise
             except Exception as e:
-                print(f"Error upserting batch: {e}", file=sys.stderr)
+                logger.error(f"Error upserting batch of {len(batch)} vectors to Pinecone namespace '{updated_namespace}': {str(e)}")
                 raise
         tasks = []
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             tasks.append(upsert_batch(batch))
         await asyncio.gather(*tasks)
-        print(f"[PINECONE] Successfully uploaded {len(records)} vectors for section {section_name}")
     return len(records)
 
 def read_from_gcs(bucket_name, file_path):
@@ -378,10 +409,17 @@ def read_from_gcs(bucket_name, file_path):
 
 @router.post("/process-10k")
 async def process_10k_gcs():
+    global failed_cleaning_requests, failed_tagging_requests, failed_embedding_requests
+    global embeddings_created, embeddings_pushed_to_pinecone, records_pushed_to_gcs
+    failed_cleaning_requests = 0
+    failed_tagging_requests = 0
+    failed_embedding_requests = 0
+    embeddings_created = 0
+    embeddings_pushed_to_pinecone = 0
+    records_pushed_to_gcs = 0
     try:
         pc = init_pinecone()
         gcs_path = f"gs://{GCS_BUCKET}/{GCS_FILE_PATH}"
-        print(f"Reading 10-K report from {gcs_path}")
         content = read_from_gcs(GCS_BUCKET, GCS_FILE_PATH)
         data = json.loads(content)
         return await process_10k_data(pc, data, gcs_path)
@@ -394,43 +432,49 @@ async def process_10k_gcs():
 @router.post("/process-by-ticker")
 async def process_by_ticker(request: ProcessTickerRequest):
     global failed_cleaning_requests, failed_tagging_requests, failed_embedding_requests
+    global embeddings_created, embeddings_pushed_to_pinecone, records_pushed_to_gcs
     failed_cleaning_requests = 0
     failed_tagging_requests = 0
     failed_embedding_requests = 0
+    embeddings_created = 0
+    embeddings_pushed_to_pinecone = 0
+    records_pushed_to_gcs = 0
     try:
         tickers = request.tickers
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = [ticker.upper() for ticker in tickers]
         pc = init_pinecone()
-        results = []
-        for ticker in tickers:
+        
+        # Define an async function to process a single ticker completely
+        async def process_single_ticker(ticker):
             try:
                 cik = await get_cik_for_ticker(ticker)
                 if not cik:
-                    results.append({
+                    return {
                         "ticker": ticker,
                         "success": False,
                         "error": "CIK not found for ticker"
-                    })
-                    continue
+                    }
+                
                 filing_data = await fetch_10k_filing(cik, ticker, request.fiscal_year)
                 if not filing_data:
-                    results.append({
+                    return {
                         "ticker": ticker,
                         "success": False,
                         "error": "Failed to fetch 10-K filing"
-                    })
-                    continue
+                    }
+                
                 if request.skip_embedding:
-                    results.append({
+                    return {
                         "ticker": ticker,
                         "success": True,
                         "message": "10-K filing fetched successfully, embedding skipped"
-                    })
-                    continue
+                    }
+                
                 result = await process_10k_data(pc, filing_data, namespace=ticker)
-                results.append({
+                
+                return {
                     "ticker": ticker,
                     "success": True,
                     "total_vectors_added": result["total_vectors_added"],
@@ -440,21 +484,17 @@ async def process_by_ticker(request: ProcessTickerRequest):
                         "tagging": failed_tagging_requests,
                         "embedding": failed_embedding_requests
                     }
-                })
+                }
             except Exception as e:
-                results.append({
+                return {
                     "ticker": ticker,
                     "success": False,
                     "error": str(e)
-                })
-        print(f"\n{'='*80}")
-        print(f"PROCESSING SUMMARY - FAILED REQUESTS")
-        print(f"{'='*80}")
-        print(f"Failed cleaning requests: {failed_cleaning_requests}")
-        print(f"Failed tagging requests: {failed_tagging_requests}")
-        print(f"Failed embedding requests: {failed_embedding_requests}")
-        print(f"Total failed requests: {failed_cleaning_requests + failed_tagging_requests + failed_embedding_requests}")
-        print(f"{'='*80}")
+                }
+        
+        # Process all tickers and wait for all of them to complete
+        results = await asyncio.gather(*[process_single_ticker(ticker) for ticker in tickers])
+        
         return {
             "success": True,
             "results": results,
@@ -485,7 +525,6 @@ async def get_cik_for_ticker(ticker: str) -> Optional[str]:
         sec_cik_url = "https://www.sec.gov/files/company_tickers.json"
         response = requests.get(sec_cik_url, headers=SEC_HEADERS)
         if response.status_code != 200:
-            print(f"Error fetching CIK data: {response.status_code}")
             return None
         cik_data = response.json()
         for entry in cik_data.values():
@@ -493,7 +532,6 @@ async def get_cik_for_ticker(ticker: str) -> Optional[str]:
                 return str(entry['cik_str']).zfill(10)
         return None
     except Exception as e:
-        print(f"Error getting CIK for {ticker}: {str(e)}")
         return None
 
 async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> Optional[dict]:
@@ -501,7 +539,6 @@ async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> 
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
         response = requests.get(url, headers=SEC_HEADERS)
         if response.status_code != 200:
-            print(f"Error fetching submission data for {symbol}: {response.status_code}")
             return None
         data = response.json()
         recent_filings = data['filings']['recent']
@@ -512,7 +549,6 @@ async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> 
         report_dates = recent_filings['reportDate']
         ten_k_indices = [i for i, form in enumerate(forms) if form == "10-K"]
         if not ten_k_indices:
-            print(f"No 10-K filing found for {symbol}")
             return None
         expected_filing_year = str(int(fiscal_year) + 1)
         fallback_filing_year = str(int(fiscal_year) + 2)
@@ -532,7 +568,6 @@ async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> 
                     filing_year = fallback_filing_year
                     break
         if index is None:
-            print(f"No 10-K filing found for {symbol} fiscal year {fiscal_year}")
             return None
         accession = accession_numbers[index]
         primary_doc = primary_documents[index]
@@ -541,7 +576,6 @@ async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> 
         html_url = f"{base_url}/{primary_doc}"
         html_response = requests.get(html_url, headers=SEC_HEADERS)
         if html_response.status_code != 200:
-            print(f"Error downloading HTML content for {symbol}: {html_response.status_code}")
             return None
         soup = BeautifulSoup(html_response.text, 'html.parser')
         filing_content = {
@@ -572,8 +606,8 @@ async def fetch_10k_filing(cik: str, symbol: str, fiscal_year: str = "2023") -> 
                 filing_content["content"][current_section].append(text)
         return filing_content
     except Exception as e:
-        print(f"Error processing {symbol}: {str(e)}")
         return None
+
 
 def clean_text(text):
     text = re.sub(r'\s+', ' ', text)
@@ -581,12 +615,12 @@ def clean_text(text):
 
 async def process_10k_data(pc, data, source_path=None, namespace=None):
     global failed_cleaning_requests, failed_tagging_requests, failed_embedding_requests
+    global embeddings_created, embeddings_pushed_to_pinecone, records_pushed_to_gcs
     meta = data.get("metadata", {})
     symbol = meta.get("symbol", "unknown")
     period = meta.get("period_of_report", "unknown")
     fiscal_year = meta.get("fiscal_year", None)
     content_sections = data.get("content", {})
-    print(f"Processing data for symbol: {symbol}, period: {period}, fiscal year: {fiscal_year}")
     MIN_CHARS = 200
     total_vectors = 0
     processed_sections = []
@@ -617,16 +651,6 @@ async def process_10k_data(pc, data, source_path=None, namespace=None):
     else:
         year = period[:4] if period and len(period) >= 4 else "unknown"
         updated_namespace = f"{symbol}-{year}"
-    print(f"\n{'='*80}")
-    print(f"PROCESSING SUMMARY FOR {symbol}")
-    print(f"{'='*80}")
-    print(f"Total vectors added: {total_vectors}")
-    print(f"Sections processed: {len(processed_sections)}")
-    print(f"Failed cleaning requests: {failed_cleaning_requests}")
-    print(f"Failed tagging requests: {failed_tagging_requests}")
-    print(f"Failed embedding requests: {failed_embedding_requests}")
-    print(f"Total failed requests: {failed_cleaning_requests + failed_tagging_requests + failed_embedding_requests}")
-    print(f"{'='*80}")
     response = {
         "success": True,
         "symbol": symbol,
@@ -639,6 +663,11 @@ async def process_10k_data(pc, data, source_path=None, namespace=None):
             "tagging": failed_tagging_requests,
             "embedding": failed_embedding_requests,
             "total": failed_cleaning_requests + failed_tagging_requests + failed_embedding_requests
+        },
+        "metrics": {
+            "embeddings_created": embeddings_created,
+            "embeddings_pushed_to_pinecone": embeddings_pushed_to_pinecone,
+            "records_pushed_to_gcs": records_pushed_to_gcs
         }
     }
     if source_path:
