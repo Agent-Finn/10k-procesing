@@ -127,6 +127,16 @@ async def clean_text_with_gemini_async(text: str, max_retries=5, initial_delay=4
     # Create a truncated version of the text for logging (first 100 chars)
     truncated_text = text[:100] + "..." if len(text) > 100 else text
     
+    # Calculate the percentage of numerical content
+    numerical_chars = sum(1 for c in text if c.isdigit())
+    numerical_percentage = (numerical_chars / len(text)) * 100 if len(text) > 0 else 0
+    
+    # Check for common patterns that indicate financial tables
+    has_table_patterns = bool(re.search(r'(\$\s*[\d,]+\s*)+', text)) or bool(re.search(r'(\d+\s*%\s*)+', text))
+    
+    # Log details about the text
+    print(f"    Text analysis: {len(text)} chars, {numerical_percentage:.1f}% numerical, table patterns: {has_table_patterns}")
+    
     prompt = (
         "Clean the following financial report text for analysis. Exclude legalese, addresses, filing info, signatures, "
         "checkmarks, tables of contents, and any tables or sections with numerical financial data. Remove page numbers, "
@@ -146,9 +156,20 @@ async def clean_text_with_gemini_async(text: str, max_retries=5, initial_delay=4
             ))
             # Check if response.text is None before calling strip()
             if response.text is None:
+                print(f"    Gemini returned None response")
                 logger.warning(f"Gemini returned None response for text: {truncated_text}")
+                print(f"    FULL TEXT that was filtered out by Gemini:\n{text[:500]}...\n")
                 return ""  # Return empty string to skip this section
             cleaned_text = response.text.strip()
+            
+            # Calculate reduction percentage
+            reduction_percentage = ((len(text) - len(cleaned_text)) / len(text)) * 100 if len(text) > 0 else 0
+            print(f"    Cleaning result: {len(cleaned_text)} chars ({reduction_percentage:.1f}% reduction)")
+            
+            # If the text was completely removed, log it
+            if len(cleaned_text) == 0:
+                print(f"    Text was completely filtered out by Gemini")
+                print(f"    FULL TEXT that was filtered out by Gemini:\n{text[:500]}...\n")
             return cleaned_text
         except Exception as e:
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -229,7 +250,9 @@ def split_section_into_chunks(text, max_length=2048, min_length=100):
     # If text is already small enough, return it as a single chunk
     if len(text) <= max_length:
         if len(text) >= min_length:
+            print(f"    Text fits in a single chunk (length: {len(text)})")
             return [(0, text)]
+        print(f"    Text is too short for chunking (length: {len(text)}, minimum: {min_length})")
         return []
     
     # Split text into sentences
@@ -237,12 +260,15 @@ def split_section_into_chunks(text, max_length=2048, min_length=100):
     sentences = [s.strip() for s in sentences if s.strip()]
     
     if not sentences:
+        print(f"    No sentences found in text after splitting")
         return []
     
     # If there's only one sentence and it's too long, return it anyway
     if len(sentences) <= 1:
         if len(text) >= min_length:
+            print(f"    Only one sentence found, using as single chunk (length: {len(text)})")
             return [(0, text)]
+        print(f"    Only one sentence found but too short (length: {len(text)}, minimum: {min_length})")
         return []
     
     # Calculate how many chunks we need based on total text length
@@ -304,16 +330,63 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     truncated_text = section_text[:100] + "..." if len(section_text) > 100 else section_text
     logger.info(f"Processing section '{section_name}' for {symbol}, period {period}. Text length: {len(section_text)}")
     
-    cleaned_text = await clean_text_with_gemini_async(section_text)
+    # Pre-chunk the text for cleaning if it's too large
+    CLEANING_MAX_LENGTH = 5000
+    if len(section_text) > CLEANING_MAX_LENGTH:
+        print(f"  Section '{section_name}' is large ({len(section_text)} chars), pre-chunking for cleaning")
+        pre_chunks = split_section_into_chunks(section_text, max_length=CLEANING_MAX_LENGTH, min_length=100)
+        if not pre_chunks:
+            print(f"  FILTERED: Section '{section_name}' - No valid pre-chunks created")
+            logger.warning(f"No pre-chunks created for section '{section_name}' of {symbol}. Original text length: {len(section_text)}")
+            return 0
+            
+        print(f"  Created {len(pre_chunks)} pre-chunks for cleaning")
+        
+        # Clean each pre-chunk separately
+        cleaned_chunks = []
+        for idx, chunk_text in pre_chunks:
+            print(f"  Cleaning pre-chunk {idx+1}/{len(pre_chunks)} - Length: {len(chunk_text)} chars")
+            cleaned_chunk = await clean_text_with_gemini_async(chunk_text)
+            if cleaned_chunk:
+                cleaned_chunks.append(cleaned_chunk)
+                
+        # Combine the cleaned chunks
+        if not cleaned_chunks:
+            print(f"  FILTERED: Section '{section_name}' - All pre-chunks were filtered out during cleaning")
+            logger.warning(f"All pre-chunks were filtered out during cleaning for section '{section_name}' of {symbol}")
+            return 0
+            
+        cleaned_text = " ".join(cleaned_chunks)
+        print(f"  Combined {len(cleaned_chunks)} cleaned pre-chunks - Total length: {len(cleaned_text)} chars")
+    else:
+        # Clean the text normally for smaller sections
+        print(f"  Cleaning section '{section_name}' - Original length: {len(section_text)} chars")
+        cleaned_text = await clean_text_with_gemini_async(section_text)
+    
     if not cleaned_text:
+        print(f"  FILTERED: Section '{section_name}' - Empty after cleaning with Gemini")
         logger.warning(f"Section '{section_name}' for {symbol} returned empty after cleaning. Original text: {truncated_text}")
         return 0
+        
+    print(f"  Cleaned section '{section_name}' - New length: {len(cleaned_text)} chars")
+    
+    # Format the cleaned text
     cleaned_text = ' '.join([para.strip() for para in cleaned_text.split('\n') if para.strip()])
     cleaned_text = ' '.join(cleaned_text.split())
+    
+    # Split into chunks for embedding
+    print(f"  Splitting section '{section_name}' into chunks for embedding")
     chunks = split_section_into_chunks(cleaned_text, max_length=2048, min_length=100)
+    
     if not chunks:
+        print(f"  FILTERED: Section '{section_name}' - No valid chunks created after cleaning")
+        print(f"  CLEANED TEXT that couldn't be chunked:\n{cleaned_text[:500]}...\n")
         logger.warning(f"No chunks created for section '{section_name}' of {symbol} after cleaning. Cleaned text length: {len(cleaned_text)}")
         return 0
+        
+    print(f"  Created {len(chunks)} chunks for section '{section_name}'")
+    
+    # Create tags
     section_tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol, num_tags=1)
     section_tag = section_tags[0] if section_tags else "default_section_tag"
     chunk_tags_tasks = [create_tags_with_gemini_async(chunk, section_name, symbol, num_tags=2) for _, chunk in chunks]
@@ -624,9 +697,31 @@ async def process_10k_data(pc, data, source_path=None, namespace=None):
     MIN_CHARS = 200
     total_vectors = 0
     processed_sections = []
+    
+    # Add logging for total sections
+    total_sections = len(content_sections)
+    print(f"\n===== PROCESSING 10-K FOR {symbol} (FISCAL YEAR: {fiscal_year}) =====")
+    print(f"Total sections found in 10-K: {total_sections}")
+    
+    # Track filtered sections
+    filtered_sections = {
+        "too_short": [],
+        "empty_after_cleaning": [],
+        "no_chunks_created": [],
+        "successful": []
+    }
+    
     async def process_section(section_name, section_text):
-        if section_name.upper() == "GENERAL" or not section_text or len(section_text) < MIN_CHARS:
+        # Check if section is "GENERAL" or too short
+        if not section_text or len(section_text) < MIN_CHARS:
+            filtered_sections["too_short"].append(section_name)
+            print(f"FILTERED: Section '{section_name}' - Too short ({len(section_text) if section_text else 0} chars, minimum {MIN_CHARS})")
+            print(f"FULL TEXT of '{section_name}':\n{section_text}\n")
             return None
+            
+        # Process the section
+        print(f"PROCESSING: Section '{section_name}' - Length: {len(section_text)} chars")
+        
         vectors_added = await process_section_to_pinecone(
             pc, 
             section_text, 
@@ -636,16 +731,42 @@ async def process_10k_data(pc, data, source_path=None, namespace=None):
             namespace=namespace,
             fiscal_year=fiscal_year
         )
-        return {"section_name": section_name, "vectors_added": vectors_added} if vectors_added > 0 else None
+        
+        if vectors_added == 0:
+            # This means either cleaning returned empty or no chunks were created
+            return {"section_name": section_name, "vectors_added": 0}
+        else:
+            filtered_sections["successful"].append(section_name)
+            print(f"SUCCESS: Section '{section_name}' - Added {vectors_added} vectors to Pinecone")
+            return {"section_name": section_name, "vectors_added": vectors_added}
+    
     tasks = []
     for section_name, paragraphs in content_sections.items():
         section_text = "\n".join([str(p) for p in paragraphs]).strip()
         tasks.append(process_section(section_name, section_text))
+    
     results = await asyncio.gather(*tasks)
+    
+    # Count sections with zero vectors (cleaned to empty or no chunks created)
     for result in results:
-        if result:
+        if result and result["vectors_added"] == 0:
+            # Check if this section is already in other filtered categories
+            if result["section_name"] not in filtered_sections["too_short"]:
+                filtered_sections["empty_after_cleaning"].append(result["section_name"])
+    
+    for result in results:
+        if result and result["vectors_added"] > 0:
             total_vectors += result["vectors_added"]
             processed_sections.append(result)
+    
+    # Print summary
+    print("\n===== FILTERING SUMMARY =====")
+    print(f"Total sections: {total_sections}")
+    print(f"Filtered - Too short (<{MIN_CHARS} chars): {len(filtered_sections['too_short'])}")
+    print(f"Filtered - Empty after cleaning: {len(filtered_sections['empty_after_cleaning'])}")
+    print(f"Successful sections: {len(filtered_sections['successful'])}")
+    print(f"Total vectors created: {total_vectors}")
+    
     if fiscal_year:
         updated_namespace = f"{symbol}-{fiscal_year}"
     else:

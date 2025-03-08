@@ -15,9 +15,10 @@ A minimal FastAPI application template for deployment to Google Cloud Run.
 ### Local Development
 
 1. Clone this repository
-2. Install dependencies:
+2. Install dependencies and start virtual environment:
    ```
    pip install -r requirements.txt
+   source venv/bin/activate
    gcloud auth application-default login  # For Google Cloud authentication
    ```
 3. Run the application:
