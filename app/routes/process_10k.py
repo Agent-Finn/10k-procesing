@@ -388,9 +388,19 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     
     # Create tags
     section_tags = await create_tags_with_gemini_async(cleaned_text, section_name, symbol, num_tags=1)
-    section_tag = section_tags[0] if section_tags else "default_section_tag"
-    chunk_tags_tasks = [create_tags_with_gemini_async(chunk, section_name, symbol, num_tags=2) for _, chunk in chunks]
+    section_tag_available = bool(section_tags and section_tags[0] != "default_tag1")
+    
+    # If we can't generate a section tag, we'll generate 3 tags per chunk instead of 2
+    chunk_tags_num = 3 if not section_tag_available else 2
+    print(f"  {'Using 3 tags per chunk (no section tag)' if not section_tag_available else 'Using section tag + 2 tags per chunk'}")
+    
+    # Generate tags for each chunk
+    chunk_tags_tasks = [create_tags_with_gemini_async(chunk, section_name, symbol, num_tags=chunk_tags_num) for _, chunk in chunks]
     all_chunk_tags = await asyncio.gather(*chunk_tags_tasks)
+    
+    # Set section tag if available
+    section_tag = section_tags[0] if section_tag_available else None
+    
     if fiscal_year is None:
         year = period[:4] if period and len(period) >= 4 else "unknown"
     else:
@@ -398,6 +408,8 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
     updated_namespace = f"{symbol}-{year}"
     index = pc.Index(INDEX_NAME, host=INDEX_HOST)
     records = []
+    
+    # Create embeddings
     MAX_EMBEDDING_BATCH_SIZE = 96
     chunk_texts = [chunk for _, chunk in chunks]
     try:
@@ -418,7 +430,10 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
                 continue
         for (chunk_idx, chunk), embedding, chunk_tags in zip(chunks, all_embeddings, all_chunk_tags):
             try:
-                metatags = [section_tag] + chunk_tags
+                # If section tag is available, use it plus chunk tags
+                # Otherwise, just use the 3 chunk tags
+                metatags = [section_tag] + chunk_tags if section_tag else chunk_tags
+                
                 raw_id = f"{symbol}-{period}-{section_name}-chunk_{chunk_idx}"
                 vector_id = normalize_vector_id(raw_id)
                 json_data = {
@@ -429,7 +444,6 @@ async def process_section_to_pinecone(pc, section_text, section_name, symbol, pe
                     "text": chunk,
                     "tags": metatags
                 }
-                # *** Updated Line ***
                 file_name = f"llm_processed_10k/{vector_id}.json"  # Changed to include '10k_files/' prefix
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, upload_to_gcs_sync, GCS_BUCKET, file_name, json_data)
