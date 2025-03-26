@@ -108,7 +108,7 @@ INDEX_NAME = "10k"
 NAMESPACE = "AAPL"
 EMBEDDING_MODEL = "llama-text-embed-v2"
 EMBEDDING_DIMENSIONS = 1024
-INDEX_HOST = "https://10k-gsf4yiq.svc.gcp-us-central1-4a9f.pinecone.io"
+INDEX_HOST = "https://10k-embeddings-gsf4yiq.svc.gcp-us-central1-4a9f.pinecone.io"
 
 SEC_HEADERS = {
     "User-Agent": "YourCompanyName YourAppName (your.email@example.com)"

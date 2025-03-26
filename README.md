@@ -12,6 +12,8 @@ A minimal FastAPI application template for deployment to Google Cloud Run.
 
 ## Getting Started
 
+Generate 10k documents using this project: https://github.com/lefterisloukas/edgar-crawler?tab=readme-ov-file
+
 ### Local Development
 
 1. Clone this repository
